@@ -5,6 +5,9 @@ services:
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000
     environment:
       PLATFORM_DB: /data/platform.db
+      ARTIFACT_DIR: /data/artifacts
+      PLATFORM_BASE_URL: "http://platform:8000"
+      ARTIFACT_MAX_BYTES: "16777216"
       PLATFORM_NODES: "node-a|模拟节点A|http://node-a:9001|8192,node-b|模拟节点B|http://node-b:9002|8192"
       NODE_CALL_TIMEOUT: "1.5"
       LOAD_TIMEOUT: "30"

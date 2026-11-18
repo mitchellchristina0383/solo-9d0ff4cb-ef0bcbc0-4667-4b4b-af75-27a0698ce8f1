@@ -64,12 +64,21 @@ async def health(base_url: str) -> CallResult:
                           error=f"连接异常: {exc.__class__.__name__}")
 
 
-async def load(base_url: str, model_name: str, replica_id: str, epoch: int, mem_mb: int) -> CallResult:
+async def load(base_url: str, model_name: str, replica_id: str, epoch: int, mem_mb: int,
+               artifact_id: str = "", expected_sha256: str = "",
+               download_url: str = "") -> CallResult:
     try:
         c = await client()
         r = await c.post(
             f"{base_url}/models/{model_name}/load",
-            params={"replica": replica_id, "epoch": epoch, "mem_mb": mem_mb},
+            params={
+                "replica": replica_id,
+                "epoch": epoch,
+                "mem_mb": mem_mb,
+                "artifact_id": artifact_id,
+                "expected_sha256": expected_sha256,
+                "download_url": download_url,
+            },
         )
         if r.status_code in (202, 200):
             return CallResult(True, r.status_code, r.json())

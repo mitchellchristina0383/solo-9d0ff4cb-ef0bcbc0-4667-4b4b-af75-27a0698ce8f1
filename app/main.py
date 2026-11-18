@@ -7,18 +7,20 @@ from contextlib import asynccontextmanager
 from typing import Literal
 
 import httpx
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import config, node_client, service
+from . import artifacts, config, node_client, service
 
 
 class DeployBody(BaseModel):
     model_name: str = Field(min_length=1, max_length=64)
     mem_per_replica_mb: int = Field(gt=0, le=1_000_000)
     replica_count: Literal[1, 2]
+    artifact_id: str | None = Field(default=None, max_length=64)
+    version: int | None = Field(default=None, gt=0)
 
 
 class ControlBody(BaseModel):
@@ -27,12 +29,15 @@ class ControlBody(BaseModel):
     unload_delay: float | None = Field(default=None, ge=0, le=60)
     ack_delay: float | None = Field(default=None, ge=0, le=60)
     load_fail: bool | None = None
+    corrupt_download: bool | None = None
+    download_timeout: bool | None = None
 
 
 async def _poll_loop() -> None:
     while True:
         try:
             await service.poll_loading()
+            await service.poll_loaded_digests()
             await service.poll_releasing()
         except Exception as exc:  # 后台循环不能因单次异常退出
             print(f"[poll] {exc.__class__.__name__}: {exc}")
@@ -77,10 +82,46 @@ async def get_nodes():
     return service.node_book()
 
 
+# ---------------------------------------------------------------- 制品登记
+@app.post("/api/artifacts", status_code=201)
+async def upload_artifact(model_name: str = Form(..., min_length=1, max_length=64),
+                          file: UploadFile = File(...)):
+    content = await file.read()
+    return artifacts.register_upload(
+        model_name.strip(), file.filename or "unnamed.bin", content
+    )
+
+
+@app.get("/api/artifacts")
+async def list_artifacts(model_name: str | None = None):
+    return artifacts.list_artifacts(model_name)
+
+
+@app.get("/api/artifacts/{artifact_id}")
+async def get_artifact(artifact_id: str):
+    return artifacts.get_artifact(artifact_id)
+
+
+@app.get("/api/artifacts/{artifact_id}/content")
+async def artifact_content(artifact_id: str):
+    meta, data = artifacts.read_artifact_bytes(artifact_id)
+    # 节点模拟器按原始字节落盘并自行核对 SHA-256
+    return Response(
+        content=data,
+        media_type="application/octet-stream",
+        headers={
+            "X-Artifact-Id": meta["id"],
+            "X-Sha256": meta["sha256"],
+            "X-Version": str(meta["version"]),
+        },
+    )
+
+
 @app.post("/api/deployments", status_code=201)
 async def create_deployment(body: DeployBody):
     return service.create_deployment(
-        body.model_name.strip(), body.mem_per_replica_mb, body.replica_count
+        body.model_name.strip(), body.mem_per_replica_mb, body.replica_count,
+        artifact_id=body.artifact_id, version=body.version,
     )
 
 

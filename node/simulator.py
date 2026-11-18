@@ -5,15 +5,20 @@
 - 可配置加载/卸载延迟、回执延迟（模拟慢节点与迟到回执）
 - 故障模式：normal / slow（高延迟）/ fail（HTTP 503 故障）/ unreachable（超时失联）
 - load_fail：加载请求直接返回 500
+- corrupt_download：从平台拉取制品后损坏字节（一次性），核对摘要失败则拒绝加载
+- download_timeout：拉取制品超时（一次性），结果不明 -> 保持 loading 占用显存待核
+- 加载前从平台下载制品并逐字节核对 SHA-256，副本记录实际上报的摘要
 - 每条副本记录带 epoch，旧 epoch 的迟到回调不会覆盖新状态（防复活）
 """
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import time
 from typing import Any, Dict
 
+import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
@@ -25,6 +30,21 @@ class ControlBody(BaseModel):
     unload_delay: float | None = Field(None, ge=0, le=60)
     ack_delay: float | None = Field(None, ge=0, le=60)
     load_fail: bool | None = None
+    corrupt_download: bool | None = None
+    download_timeout: bool | None = None
+
+
+# 测试可替换的 HTTP 客户端工厂（ASGI 传输下由测试注入）
+_http_client_factory = None
+
+
+async def _default_client_factory(timeout: float) -> httpx.AsyncClient:
+    return httpx.AsyncClient(timeout=timeout)
+
+
+async def get_http_client(timeout: float = 5.0) -> httpx.AsyncClient:
+    factory = _http_client_factory or _default_client_factory
+    return await factory(timeout)
 
 
 def create_app(
@@ -34,10 +54,12 @@ def create_app(
     default_load_delay: float = 0.4,
     default_unload_delay: float = 0.2,
     unreachable_sleep: float = 3600.0,
+    download_timeout_sleep: float = 3600.0,
 ) -> FastAPI:
     app = FastAPI(title=f"节点模拟器 {node_id}")
 
-    # rid -> {model, mem_mb, epoch, status: loading|loaded|unloaded|failed}
+    # rid -> {model, mem_mb, epoch, status: loading|loaded|unloaded|failed,
+    #         artifact_id, expected_sha256, loaded_sha256}
     replicas: Dict[str, Dict[str, Any]] = {}
     control: Dict[str, Any] = {
         "mode": "normal",
@@ -45,6 +67,8 @@ def create_app(
         "unload_delay": default_unload_delay,
         "ack_delay": 0.0,
         "load_fail": False,
+        "corrupt_download": False,
+        "download_timeout": False,
     }
     tasks: set[asyncio.Task] = set()
 
@@ -108,6 +132,52 @@ def create_app(
         rec = replicas.get(rid)
         if rec and rec["epoch"] == epoch and rec["status"] != "unloaded":
             rec["status"] = "unloaded"
+            rec["loaded_sha256"] = None
+
+    async def fetch_artifact(download_url: str, expected_sha256: str) -> tuple[bytes | None, str | None, str | None]:
+        """从平台拉取制品并核对字节。
+
+        返回 (data, actual_sha256, error)：
+        - 成功：data 与 actual_sha256 有值，error 为 None
+        - 摘要不符（损坏）：actual_sha256 有值，error 说明期望/实际摘要
+        - 下载超时/连接失败：data 为 None，error 说明节点状态不可知
+        """
+        if control["download_timeout"]:
+            control["download_timeout"] = False  # 一次性故障
+            if download_timeout_sleep > 0:
+                await asyncio.sleep(download_timeout_sleep)
+            # 下载在途超时：节点无法确认自己是否持有完整文件，保持 loading 占用待核
+            return None, None, "制品下载超时，加载结果未知（保留显存待核）"
+
+        client = await get_http_client()
+        try:
+            resp = await client.get(download_url)
+            if resp.status_code != 200:
+                return None, None, f"平台制品下载失败(HTTP {resp.status_code})"
+            data = resp.content
+        except httpx.TimeoutException as exc:
+            # 下载在途超时：平台是否已分发、本地是否落盘均不可知，调用方保持占用待核
+            return None, None, f"制品下载超时，加载结果未知（保留显存待核）: {exc.__class__.__name__}"
+        except (httpx.HTTPError, OSError) as exc:
+            return None, None, f"制品下载连接失败（结果未知，保留显存待核）: {exc.__class__.__name__}"
+
+        if control["corrupt_download"]:
+            control["corrupt_download"] = False  # 一次性故障
+            if data:
+                # 翻转/截断字节，模拟传输或落盘损坏
+                mutated = bytearray(data)
+                mutated[0] = (mutated[0] ^ 0xFF) & 0xFF
+                if len(mutated) > 1:
+                    mutated[-1] = (mutated[-1] ^ 0x01) & 0xFF
+                data = bytes(mutated)
+
+        actual = hashlib.sha256(data).hexdigest()
+        if expected_sha256 and actual != expected_sha256:
+            return data, actual, (
+                f"制品字节核对失败：实际 sha256={actual[:12]}… 与期望 "
+                f"{expected_sha256[:12]}… 不符，拒绝加载损坏文件"
+            )
+        return data, actual, None
 
     @app.post("/models/{model_name}/load")
     async def load(model_name: str, request: Request):
@@ -115,12 +185,17 @@ def create_app(
         rid = params.get("replica")
         epoch = int(params.get("epoch", "1"))
         mem_mb = int(params.get("mem_mb", "0"))
+        artifact_id = params.get("artifact_id", "")
+        expected_sha256 = params.get("expected_sha256", "")
+        download_url = params.get("download_url", "")
         if not rid:
             return JSONResponse({"detail": "缺少 replica 参数"}, status_code=400)
 
         if control["load_fail"]:
             replicas[rid] = {
                 "model": model_name, "mem_mb": mem_mb, "epoch": epoch, "status": "failed",
+                "artifact_id": artifact_id, "expected_sha256": expected_sha256,
+                "loaded_sha256": None,
             }
             await asyncio.sleep(control["ack_delay"])
             return JSONResponse(
@@ -129,12 +204,38 @@ def create_app(
 
         existing = replicas.get(rid)
         if existing and existing["epoch"] == epoch and existing["status"] == "loaded":
-            return {"replica": rid, "epoch": epoch, "status": "loaded"}
+            return {"replica": rid, "epoch": epoch, "status": "loaded",
+                    "loaded_sha256": existing.get("loaded_sha256")}
 
-        # 同一 rid 的新 epoch 直接覆盖，节点已“忘记”旧副本
+        # 先登记 loading（占住显存语义），再从平台拉取制品
         replicas[rid] = {
             "model": model_name, "mem_mb": mem_mb, "epoch": epoch, "status": "loading",
+            "artifact_id": artifact_id, "expected_sha256": expected_sha256,
+            "loaded_sha256": None,
         }
+
+        if download_url:
+            data, actual_sha, dl_error = await fetch_artifact(download_url, expected_sha256)
+            if dl_error is not None:
+                if actual_sha:
+                    # 损坏：节点明确拒绝加载（显式失败，确认未占用可生效副本）
+                    replicas[rid]["status"] = "failed"
+                    replicas[rid]["loaded_sha256"] = actual_sha
+                    await asyncio.sleep(control["ack_delay"])
+                    return JSONResponse(
+                        {"detail": dl_error, "replica": rid,
+                         "expected_sha256": expected_sha256, "actual_sha256": actual_sha},
+                        status_code=422,
+                    )
+                # 下载超时/连接异常：结果不可知，保持 loading 与占用，待平台超时对账
+                await asyncio.sleep(control["ack_delay"])
+                return JSONResponse(
+                    {"replica": rid, "epoch": epoch, "status": "loading",
+                     "detail": dl_error}, status_code=202
+                )
+            replicas[rid]["loaded_sha256"] = actual_sha
+
+        # 同一 rid 的新 epoch 直接覆盖，节点已“忘记”旧副本
         schedule(control["load_delay"], finish_load(rid, epoch, control["load_delay"]))
         await asyncio.sleep(control["ack_delay"])
         return JSONResponse(
@@ -186,6 +287,8 @@ def create_app(
             unload_delay=default_unload_delay,
             ack_delay=0.0,
             load_fail=False,
+            corrupt_download=False,
+            download_timeout=False,
         )
         return {"node_id": node_id, "reset": True}
 
@@ -203,4 +306,5 @@ app = create_app(
     default_load_delay=float(os.environ.get("DEFAULT_LOAD_DELAY", "0.4")),
     default_unload_delay=float(os.environ.get("DEFAULT_UNLOAD_DELAY", "0.2")),
     unreachable_sleep=float(os.environ.get("UNREACHABLE_SLEEP", "3600")),
+    download_timeout_sleep=float(os.environ.get("DOWNLOAD_TIMEOUT_SLEEP", "3600")),
 )

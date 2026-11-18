@@ -118,7 +118,9 @@ def node_book() -> list[dict[str, Any]]:
 
 
 # ---------------------------------------------------------------- 提交部署
-def create_deployment(model_name: str, mem_per_replica_mb: int, replica_count: int) -> dict:
+def create_deployment(model_name: str, mem_per_replica_mb: int, replica_count: int,
+                      artifact_id: str | None = None,
+                      version: int | None = None) -> dict:
     model_name = model_name.strip()
     if not model_name:
         raise HTTPException(400, "模型名不能为空")
@@ -126,6 +128,11 @@ def create_deployment(model_name: str, mem_per_replica_mb: int, replica_count: i
         raise HTTPException(400, "每副本显存必须为正整数")
     if replica_count not in (1, 2):
         raise HTTPException(400, "副本数仅支持 1 或 2")
+
+    # 选定不可改写的制品版本；部署记录固化其 id 与摘要，之后同名再传新版本
+    # 也不会改变本部署（含在途加载）所使用的版本
+    from . import artifacts
+    artifact = artifacts.get_artifact_for_deploy(model_name, artifact_id, version)
 
     dep_id = "dep-" + uuid.uuid4().hex[:10]
     with db.tx() as conn:
@@ -164,22 +171,26 @@ def create_deployment(model_name: str, mem_per_replica_mb: int, replica_count: i
         ts = now()
         conn.execute(
             "INSERT INTO deployments(id,model_name,mem_per_replica_mb,replica_count,status,"
-            "reason,epoch,attempts,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            "reason,epoch,attempts,artifact_id,artifact_version,expected_sha256,"
+            "created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (dep_id, model_name, mem_per_replica_mb, replica_count,
-             models.DEP_PENDING, "已预留显存，等待加载", 1, 1, ts, ts),
+             models.DEP_PENDING, "已预留显存，等待加载", 1, 1,
+             artifact["id"], artifact["version"], artifact["sha256"], ts, ts),
         )
         replica_ids = []
         for seq, n in enumerate(chosen, start=1):
             rid = f"{dep_id}-r{seq}-e1"
             conn.execute(
                 "INSERT INTO replicas(id,deployment_id,node_id,seq,epoch,status,mem_mb,"
-                "last_error,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                "last_error,expected_sha256,loaded_sha256,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                 (rid, dep_id, n["node_id"], seq, 1, models.REP_PENDING,
-                 mem_per_replica_mb, None, ts, ts),
+                 mem_per_replica_mb, None, artifact["sha256"], None, ts, ts),
             )
             replica_ids.append(rid)
         log_event(conn, "RESERVE",
-                  f"部署 {model_name}：在 {','.join(n['name'] for n in chosen)} 预留 "
+                  f"部署 {model_name} v{artifact['version']}（sha256={artifact['sha256'][:12]}…）："
+                  f"在 {','.join(n['name'] for n in chosen)} 预留 "
                   f"{replica_count}×{mem_per_replica_mb}MB", dep_id)
 
     for rid in replica_ids:
@@ -219,6 +230,28 @@ def _evaluate(conn, dep_id: str) -> None:
     reason = dep["reason"]
     trouble = {models.REP_TIMEOUT, models.REP_UNVERIFIED, models.REP_RELEASING}
     terminal = {models.REP_RELEASED, models.REP_LOAD_FAILED}
+    # 兜底：已加载但摘要与所选版本不符的副本，一律视为待核，绝不参与可用判定
+    mismatched = [
+        r for r in reps
+        if r["status"] == models.REP_LOADED
+        and r["expected_sha256"] and r["loaded_sha256"]
+        and r["loaded_sha256"] != r["expected_sha256"]
+    ]
+    if mismatched:
+        for r in mismatched:
+            conn.execute(
+                "UPDATE replicas SET status=?,last_error=?,updated_at=? WHERE id=?",
+                (models.REP_UNVERIFIED,
+                 "摘要与所选版本不符（评估兜底拦截），拒绝判可用", now(), r["id"]),
+            )
+            log_event(conn, "DIGEST_GUARD",
+                      f"副本 {r['id']} 已加载但摘要不符，兜底转待核",
+                      dep_id, r["id"], r["node_id"])
+        reps = conn.execute(
+            "SELECT * FROM replicas WHERE deployment_id=? ORDER BY seq,epoch", (dep_id,)
+        ).fetchall()
+        reps = [r for r in reps if r["epoch"] == dep["epoch"]]
+        statuses = {r["status"] for r in reps}
     if statuses & trouble:
         # 任何待核/释放中的副本都要保留占用，部署整体保持待核
         new_status = models.DEP_UNVERIFIED
@@ -266,7 +299,13 @@ async def _load_replica(rid: str) -> None:
                   dep["id"], rid, node.node_id)
 
     result = await node_client.load(
-        node.base_url, dep["model_name"], rid, rep["epoch"], rep["mem_mb"]
+        node.base_url, dep["model_name"], rid, rep["epoch"], rep["mem_mb"],
+        artifact_id=dep["artifact_id"] or "",
+        expected_sha256=dep["expected_sha256"] or "",
+        download_url=(
+            f"{config.PLATFORM_BASE_URL}/api/artifacts/{dep['artifact_id']}/content"
+            if dep["artifact_id"] else ""
+        ),
     )
 
     with db.tx() as conn:
@@ -317,14 +356,39 @@ async def poll_loading() -> None:
                 # 未超时则继续等待，维持 LOADING 与预留
                 continue
             if remote == "loaded":
-                _set_replica(conn, rep["id"], models.REP_LOADED, confirmed=True)
-                log_event(conn, "LOAD_CONFIRMED", f"{node.name} 确认加载完成",
-                          dep["id"], rep["id"], node.node_id)
-                _evaluate(conn, dep["id"])
+                remote_sha = (result.data or {}).get("loaded_sha256")
+                expected = cur["expected_sha256"] or dep["expected_sha256"]
+                if expected and remote_sha and remote_sha != expected:
+                    # 节点确认已加载，但字节摘要与所选版本不符：绝不能判可用，
+                    # 保留占用转待核并自动撤销错误版本
+                    _set_replica(
+                        conn, rep["id"], models.REP_UNVERIFIED,
+                        error=(f"节点加载的文件摘要 {remote_sha[:12]}… 与所选版本 "
+                               f"v{dep['artifact_version']} 期望 {expected[:12]}… 不符，拒绝判可用"),
+                    )
+                    conn.execute(
+                        "UPDATE replicas SET loaded_sha256=? WHERE id=?",
+                        (remote_sha, rep["id"]),
+                    )
+                    log_event(conn, "LOAD_DIGEST_MISMATCH",
+                              f"节点上报摘要 {remote_sha} ≠ 期望 {expected}，转待核并撤销错误版本",
+                              dep["id"], rep["id"], node.node_id)
+                    _evaluate(conn, dep["id"])
+                else:
+                    _set_replica(conn, rep["id"], models.REP_LOADED, confirmed=True)
+                    conn.execute(
+                        "UPDATE replicas SET loaded_sha256=? WHERE id=?",
+                        (remote_sha or expected, rep["id"]),
+                    )
+                    log_event(conn, "LOAD_CONFIRMED",
+                              f"{node.name} 确认加载完成，摘要 {str(remote_sha)[:12]}… 与所选版本相符",
+                              dep["id"], rep["id"], node.node_id)
+                    _evaluate(conn, dep["id"])
             elif remote == "failed":
+                detail = (result.data or {}).get("detail") or "节点上报加载失败"
                 _set_replica(conn, rep["id"], models.REP_LOAD_FAILED,
-                             error="节点上报加载失败", released=True)
-                log_event(conn, "LOAD_FAIL", "节点上报加载失败", dep["id"], rep["id"], node.node_id)
+                             error=detail, released=True)
+                log_event(conn, "LOAD_FAIL", detail, dep["id"], rep["id"], node.node_id)
                 _evaluate(conn, dep["id"])
             elif remote == "unknown":
                 # 节点明确不存在该副本，远端不占显存，本侧预留可释放
@@ -340,6 +404,61 @@ async def poll_loading() -> None:
                     log_event(conn, "LOAD_TIMEOUT", "节点在途过久，转待核",
                               dep["id"], rep["id"], node.node_id)
                     _evaluate(conn, dep["id"])
+
+
+async def poll_loaded_digests() -> None:
+    """周期性审计已加载副本：节点实际摘要必须与部署所选版本相符。
+
+    覆盖迟到回执/带外篡改等场景：即使副本已被确认 LOADED，只要节点当前
+    上报的摘要与所选版本不符，就立即转待核（保留占用）并撤销错误版本，
+    绝不让错误版本停留在可用状态。
+    """
+    reps = db.query(
+        "SELECT * FROM replicas WHERE status=? ORDER BY updated_at", (models.REP_LOADED,)
+    )
+    for rep in reps:
+        node = config.NODE_MAP[rep["node_id"]]
+        dep = db.query_one("SELECT * FROM deployments WHERE id=?", (rep["deployment_id"],))
+        result = await node_client.query_replica(node.base_url, rep["id"], rep["epoch"])
+        if not result.ok or result.transport_failed:
+            continue  # 失联时维持已确认状态，待健康监测/对账流程处理
+        remote = (result.data or {}).get("status")
+        remote_sha = (result.data or {}).get("loaded_sha256")
+        expected = rep["expected_sha256"] or (dep["expected_sha256"] if dep else None)
+        with db.tx() as conn:
+            cur = conn.execute("SELECT * FROM replicas WHERE id=?", (rep["id"],)).fetchone()
+            if cur["status"] != models.REP_LOADED:
+                continue
+            if remote != "loaded":
+                # 账本已加载、节点却没有对应加载：转待核，交由对账/释放流程
+                _set_replica(conn, rep["id"], models.REP_UNVERIFIED,
+                             error=f"审计发现节点状态为 {remote}，与账本“已加载”不一致")
+                log_event(conn, "AUDIT_MISSING", "已加载副本在节点上不存在，转待核",
+                          dep["id"], rep["id"], node.node_id)
+                _evaluate(conn, dep["id"])
+            elif expected and remote_sha and remote_sha != expected:
+                _set_replica(
+                    conn, rep["id"], models.REP_UNVERIFIED,
+                    error=(f"审计发现节点实际摘要 {remote_sha[:12]}… 与所选版本 "
+                           f"v{dep['artifact_version']} 期望 {expected[:12]}… 不符，拒绝判可用"),
+                )
+                conn.execute(
+                    "UPDATE replicas SET loaded_sha256=? WHERE id=?",
+                    (remote_sha, rep["id"]),
+                )
+                log_event(conn, "AUDIT_DIGEST_MISMATCH",
+                          f"实际 {remote_sha} ≠ 期望 {expected}，错误版本转待核并撤销",
+                          dep["id"], rep["id"], node.node_id)
+                _evaluate(conn, dep["id"])
+            elif remote_sha and not cur["loaded_sha256"]:
+                conn.execute(
+                    "UPDATE replicas SET loaded_sha256=? WHERE id=?",
+                    (remote_sha, rep["id"]),
+                )
+        # 事务外发起撤销，避免与节点调用嵌套
+        cur = db.query_one("SELECT * FROM replicas WHERE id=?", (rep["id"],))
+        if cur and cur["status"] == models.REP_UNVERIFIED:
+            await request_release(rep["id"], "审计发现错误版本/不一致，撤销节点加载")
 
 
 # ---------------------------------------------------------------- 释放/对账
@@ -427,30 +546,68 @@ async def reconcile(dep_id: str) -> dict:
                 log_event(conn, "RECONCILE_BLOCKED", note, dep_id, cur["id"], node.node_id)
                 continue
             remote = (result.data or {}).get("status")
+            remote_sha = (result.data or {}).get("loaded_sha256")
+            expected = cur["expected_sha256"] or dep["expected_sha256"]
+            digest_ok = (not expected or not remote_sha or remote_sha == expected)
             st = cur["status"]
             if remote == "loaded":
                 mark_node_online(node.node_id)
-                if st in (models.REP_LOADING, models.REP_TIMEOUT, models.REP_UNVERIFIED):
+                if not digest_ok:
+                    # 手动对账同样不能把错误版本判为可用：记录实际摘要，转待核并撤销
+                    _set_replica(
+                        conn, cur["id"], models.REP_UNVERIFIED,
+                        error=(f"对账发现节点实际摘要 {remote_sha[:12]}… 与所选版本 "
+                               f"v{dep['artifact_version']} 期望 {expected[:12]}… 不符，拒绝判可用"),
+                    )
+                    conn.execute(
+                        "UPDATE replicas SET loaded_sha256=? WHERE id=?",
+                        (remote_sha, cur["id"]),
+                    )
+                    notes.append(f"{node.name} 加载的是错误版本（摘要不符），转待核并撤销")
+                    log_event(conn, "RECONCILE_DIGEST_MISMATCH",
+                              f"实际 {remote_sha} ≠ 期望 {expected}，错误版本不得判可用",
+                              dep_id, cur["id"], node.node_id)
+                elif st in (models.REP_LOADING, models.REP_TIMEOUT, models.REP_UNVERIFIED):
                     # 超时/待核后核实加载其实已成功：同一 epoch 的合法补确认
                     _set_replica(conn, cur["id"], models.REP_LOADED, confirmed=True)
-                    notes.append(f"{node.name} 上副本实际已加载，补确认")
+                    conn.execute(
+                        "UPDATE replicas SET loaded_sha256=? WHERE id=?",
+                        (remote_sha or expected, cur["id"]),
+                    )
+                    notes.append(f"{node.name} 上副本实际已加载且摘要相符，补确认")
                     log_event(conn, "RECONCILE_LOADED",
-                              "失联/超时后核实加载其实已成功，补确认",
+                              "失联/超时后核实加载其实已成功，摘要核对相符，补确认",
                               dep_id, cur["id"], node.node_id)
                 elif st == models.REP_RELEASING:
-                    notes.append(f"{node.name} 仍持有旧加载，继续撤销")
-                    log_event(conn, "RECONCILE_STILL_HELD", "旧加载仍在，重新卸载",
-                              dep_id, cur["id"], node.node_id)
+                    if not digest_ok:
+                        notes.append(f"{node.name} 仍持有错误版本（摘要不符），继续撤销直至确认释放")
+                        log_event(conn, "RECONCILE_STILL_WRONG_DIGEST",
+                                  f"错误版本仍在节点上（实际 {remote_sha} ≠ 期望 {expected}），继续卸载",
+                                  dep_id, cur["id"], node.node_id)
+                    else:
+                        notes.append(f"{node.name} 仍持有旧加载，继续撤销")
+                        log_event(conn, "RECONCILE_STILL_HELD", "旧加载仍在，重新卸载",
+                                  dep_id, cur["id"], node.node_id)
                 else:
                     notes.append(f"{node.name} 上副本正常加载中状态一致")
             elif remote in ("unknown", "unloaded"):
                 mark_node_online(node.node_id)
                 if st in (models.REP_TIMEOUT, models.REP_UNVERIFIED, models.REP_RELEASING):
+                    was_wrong = bool(
+                        expected and cur["loaded_sha256"]
+                        and cur["loaded_sha256"] != expected
+                    )
                     _set_replica(conn, cur["id"], models.REP_RELEASED,
                                  error=f"对账确认节点无残留（remote={remote}）", released=True)
-                    notes.append(f"{node.name} 无残留，副本 {cur['id']} 确认释放")
-                    log_event(conn, "RECONCILE_RELEASED", "节点确认无副本，释放显存",
-                              dep_id, cur["id"], node.node_id)
+                    if was_wrong:
+                        notes.append(f"{node.name} 上的错误版本已撤销，确认无残留后释放（摘要不符未判可用）")
+                        log_event(conn, "RECONCILE_WRONG_RELEASED",
+                                  "错误版本已卸载且节点无残留，确认释放",
+                                  dep_id, cur["id"], node.node_id)
+                    else:
+                        notes.append(f"{node.name} 无残留，副本 {cur['id']} 确认释放")
+                        log_event(conn, "RECONCILE_RELEASED", "节点确认无副本，释放显存",
+                                  dep_id, cur["id"], node.node_id)
                 elif st == models.REP_LOADED:
                     # 账本认为已加载，节点却没有——不一致，先待核再释放
                     _set_replica(conn, cur["id"], models.REP_UNVERIFIED,
@@ -470,8 +627,18 @@ async def reconcile(dep_id: str) -> dict:
                 notes.append(f"{node.name} 上报失败，释放预留")
             else:  # loading / unloading
                 if st == models.REP_TIMEOUT:
-                    # 节点仍在加载：给一次确认机会，维持等待，下轮轮询继续核实
-                    notes.append(f"{node.name} 上副本仍在 {remote}，维持待核继续观察")
+                    if remote == "loading":
+                        # 下载超时后节点仍在加载（结果不明期已过，节点明确仍在途）：
+                        # 重新纳入轮询等待确认，保留占用
+                        _set_replica(conn, cur["id"], models.REP_LOADING,
+                                     error="对账确认节点仍在加载，重新等待确认（占用保留）")
+                        notes.append(f"{node.name} 上副本仍在 loading，恢复轮询等待确认")
+                        log_event(conn, "RECONCILE_RELOADING",
+                                  "下载超时后对账确认节点仍在加载，转轮询等待",
+                                  dep_id, cur["id"], node.node_id)
+                    else:
+                        # 节点仍在卸载等其他在途：给一次确认机会，维持等待，下轮轮询继续核实
+                        notes.append(f"{node.name} 上副本仍在 {remote}，维持待核继续观察")
                 else:
                     notes.append(f"{node.name} 上副本处于 {remote}，维持 {models.REP_STATUS_CN[st]}")
             _evaluate(conn, dep_id)
@@ -529,18 +696,21 @@ def retry_deployment(dep_id: str) -> dict:
             rid = f"{dep_id}-r{seq}-e{new_epoch}"
             conn.execute(
                 "INSERT INTO replicas(id,deployment_id,node_id,seq,epoch,status,mem_mb,"
-                "last_error,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                "last_error,expected_sha256,loaded_sha256,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                 (rid, dep_id, n["node_id"], seq, new_epoch, models.REP_PENDING,
-                 dep["mem_per_replica_mb"], None, ts, ts),
+                 dep["mem_per_replica_mb"], None, dep["expected_sha256"], None, ts, ts),
             )
             new_ids.append(rid)
         conn.execute(
             "UPDATE deployments SET status=?,reason=?,epoch=?,attempts=?,updated_at=? WHERE id=?",
-            (models.DEP_PENDING, f"第 {new_epoch} 次尝试，加载进行中", new_epoch,
-             dep["attempts"] + 1, ts, dep_id),
+            (models.DEP_PENDING,
+             f"第 {new_epoch} 次尝试，加载进行中（固定使用 v{dep['artifact_version']}，版本不变）",
+             new_epoch, dep["attempts"] + 1, ts, dep_id),
         )
         log_event(conn, "RETRY",
-                  f"失败后重试，开启 epoch={new_epoch}，旧 epoch={dep['epoch']} 副本保持终态不复活",
+                  f"失败后重试，开启 epoch={new_epoch}，旧 epoch={dep['epoch']} 副本保持终态不复活；"
+                  f"制品版本固定为 v{dep['artifact_version']}（sha256={str(dep['expected_sha256'])[:12]}…）",
                   dep_id)
 
     for rid in new_ids:
@@ -589,11 +759,16 @@ def get_deployment(dep_id: str) -> dict:
     )
     d = dict(dep)
     d["status_cn"] = models.DEP_STATUS_CN[dep["status"]]
+    d["version_label"] = f"v{dep['artifact_version']}" if dep["artifact_version"] else None
     d["replicas"] = []
     for r in reps:
         rr = dict(r)
         rr["status_cn"] = models.REP_STATUS_CN[r["status"]]
         rr["node_name"] = config.NODE_MAP[r["node_id"]].name
+        rr["digest_match"] = (
+            None if not r["loaded_sha256"] or not r["expected_sha256"]
+            else r["loaded_sha256"] == r["expected_sha256"]
+        )
         d["replicas"].append(rr)
     d["events"] = [dict(e) for e in events]
     return d

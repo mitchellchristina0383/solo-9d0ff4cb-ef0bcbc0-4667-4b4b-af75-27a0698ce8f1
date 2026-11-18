@@ -8,3 +8,4 @@ data/
 *.db-shm
 .pytest_cache/
 *.egg-info/
+.smoke/

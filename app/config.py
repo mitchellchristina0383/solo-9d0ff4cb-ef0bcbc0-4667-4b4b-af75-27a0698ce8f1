@@ -40,6 +40,12 @@ POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL", "1.0"))
 # 节点健康探测间隔
 HEALTH_INTERVAL = float(os.environ.get("HEALTH_INTERVAL", "10.0"))
 
+# 模型制品仓库：内容寻址文件目录与单文件上传上限（本地小文件）
+ARTIFACT_DIR = os.environ.get("ARTIFACT_DIR", os.path.join("data", "artifacts"))
+ARTIFACT_MAX_BYTES = int(os.environ.get("ARTIFACT_MAX_BYTES", str(16 * 1024 * 1024)))
+# 节点回平台拉取制品内容时使用的基址（容器内默认走 Compose 服务名 platform:8000）
+PLATFORM_BASE_URL = os.environ.get("PLATFORM_BASE_URL", "http://platform:8000").rstrip("/")
+
 NODES: list[NodeConfig] = _nodes_from_env()
 NODE_MAP: dict[str, NodeConfig] = {n.node_id: n for n in NODES}
 

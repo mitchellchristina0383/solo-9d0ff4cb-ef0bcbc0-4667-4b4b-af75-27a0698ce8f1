@@ -29,6 +29,9 @@ CREATE TABLE IF NOT EXISTS deployments (
     reason                TEXT,
     epoch                 INTEGER NOT NULL DEFAULT 1,
     attempts              INTEGER NOT NULL DEFAULT 1,
+    artifact_id           TEXT,
+    artifact_version      INTEGER,
+    expected_sha256       TEXT,
     created_at            TEXT NOT NULL,
     updated_at            TEXT NOT NULL
 );
@@ -41,6 +44,8 @@ CREATE TABLE IF NOT EXISTS replicas (
     status         TEXT NOT NULL,
     mem_mb         INTEGER NOT NULL,
     last_error     TEXT,
+    expected_sha256  TEXT,
+    loaded_sha256    TEXT,
     created_at     TEXT NOT NULL,
     updated_at     TEXT NOT NULL,
     confirmed_at   TEXT,
@@ -48,6 +53,19 @@ CREATE TABLE IF NOT EXISTS replicas (
 );
 CREATE INDEX IF NOT EXISTS idx_replicas_dep ON replicas(deployment_id);
 CREATE INDEX IF NOT EXISTS idx_replicas_node ON replicas(node_id);
+CREATE TABLE IF NOT EXISTS artifacts (
+    id           TEXT PRIMARY KEY,
+    model_name   TEXT NOT NULL,
+    version      INTEGER NOT NULL,
+    sha256       TEXT NOT NULL,
+    size_bytes   INTEGER NOT NULL,
+    filename     TEXT NOT NULL,
+    storage_path TEXT NOT NULL,
+    created_at   TEXT NOT NULL,
+    UNIQUE(model_name, version),
+    UNIQUE(model_name, sha256)
+);
+CREATE INDEX IF NOT EXISTS idx_artifacts_model ON artifacts(model_name, version);
 CREATE TABLE IF NOT EXISTS events (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
     deployment_id  TEXT,
@@ -58,6 +76,22 @@ CREATE TABLE IF NOT EXISTS events (
     created_at     TEXT NOT NULL
 );
 """
+
+# 既有库的轻量迁移：补齐制品功能新增列（表本身由 SCHEMA 的 IF NOT EXISTS 建立）
+MIGRATIONS = (
+    ("deployments", "artifact_id", "ALTER TABLE deployments ADD COLUMN artifact_id TEXT"),
+    ("deployments", "artifact_version", "ALTER TABLE deployments ADD COLUMN artifact_version INTEGER"),
+    ("deployments", "expected_sha256", "ALTER TABLE deployments ADD COLUMN expected_sha256 TEXT"),
+    ("replicas", "expected_sha256", "ALTER TABLE replicas ADD COLUMN expected_sha256 TEXT"),
+    ("replicas", "loaded_sha256", "ALTER TABLE replicas ADD COLUMN loaded_sha256 TEXT"),
+)
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    for table, column, ddl in MIGRATIONS:
+        cols = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+        if column not in cols:
+            conn.execute(ddl)
 
 
 def connect() -> sqlite3.Connection:
@@ -70,6 +104,7 @@ def connect() -> sqlite3.Connection:
         _conn.execute("PRAGMA foreign_keys=ON")
         _conn.execute("PRAGMA busy_timeout=30000")
         _conn.executescript(SCHEMA)
+        _migrate(_conn)
     return _conn
 
 

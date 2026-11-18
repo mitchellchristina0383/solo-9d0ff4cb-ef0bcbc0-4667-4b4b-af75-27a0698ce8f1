@@ -23,6 +23,7 @@
   .bar > div { height:100%; background:var(--blue); }
   .bar > div.warn { background:#d97706; } .bar > div.full { background:#dc2626; }
   .muted { color:#6b7280; font-size:12px; }
+  .mono { font-family: ui-monospace,Menlo,Consolas,monospace; font-size:11px; word-break:break-all; }
   .badge { display:inline-block; padding:2px 8px; border-radius:999px; font-size:12px; color:#fff; }
   .badge-success{background:#16a34a;} .badge-danger{background:#dc2626;}
   .badge-warning{background:#d97706;} .badge-info{background:#2563eb;}
@@ -39,6 +40,7 @@
   th { color:#475569; font-weight:600; background:#f8fafc; }
   .rep { font-size:12px; background:#f8fafc; border:1px solid var(--border); border-radius:6px;
          padding:6px 8px; margin:4px 0; }
+  .rep.bad { border-color:#dc2626; background:#fef2f2; }
   .reason { font-size:12px; color:#92400e; margin-top:4px; }
   .events { max-height:160px; overflow:auto; font-size:12px; }
   .events div { padding:3px 0; border-bottom:1px dashed #e5e7eb; }
@@ -47,6 +49,11 @@
                 margin-bottom:8px; font-size:13px; } .toast-item.err{background:#991b1b;}
   .controls button { margin-top:6px; }
   details summary { cursor:pointer; font-size:13px; color:var(--blue); margin:6px 0; }
+  .art-row { display:flex; justify-content:space-between; gap:8px; padding:8px 0;
+             border-bottom:1px dashed var(--border); font-size:12px; }
+  .art-row:last-child { border-bottom:0; }
+  .tag { display:inline-block; background:#e0e7ff; color:#3730a3; border-radius:4px;
+         padding:1px 6px; font-size:11px; margin-left:4px; }
 </style>
 </head>
 <body>
@@ -62,10 +69,23 @@
         <div id="nodes"></div>
       </div>
       <div class="card">
-        <h2>提交模型部署</h2>
-        <form id="deploy-form">
+        <h2>模型制品登记（不可改写版本）</h2>
+        <form id="artifact-form">
           <label>模型名</label>
           <input name="model_name" placeholder="例如 llama3-8b" required maxlength="64">
+          <label>本地制品文件（小文件，≤16MB，按字节生成 SHA-256）</label>
+          <input name="file" type="file" required>
+          <div style="margin-top:12px"><button type="submit">上传并登记版本</button></div>
+        </form>
+        <div id="artifacts" style="margin-top:10px"></div>
+      </div>
+      <div class="card">
+        <h2>提交模型部署（选择制品版本）</h2>
+        <form id="deploy-form">
+          <label>模型名（须先登记制品）</label>
+          <input name="model_name" id="dep-model" placeholder="例如 llama3-8b" required maxlength="64">
+          <label>制品版本（同名新版本不影响在途/已有部署）</label>
+          <select name="artifact_id" id="dep-artifact" required></select>
           <label>每副本显存 (MB)</label>
           <input name="mem_per_replica_mb" type="number" min="1" value="2048" required>
           <label>副本数（同一部署的副本分处不同节点）</label>
@@ -88,7 +108,7 @@
   <div class="card">
     <h2>部署列表与分配状态</h2>
     <table>
-      <thead><tr><th>部署/模型</th><th>规格</th><th>状态</th><th>副本分配</th><th>操作</th></tr></thead>
+      <thead><tr><th>部署/模型</th><th>规格/版本</th><th>状态</th><th>副本分配与实际摘要</th><th>操作</th></tr></thead>
       <tbody id="deployments"></tbody>
     </table>
   </div>
@@ -102,7 +122,7 @@ function toast(msg, isErr){
   const t=document.createElement('div');
   t.className='toast-item'+(isErr?' err':''); t.textContent=msg;
   document.getElementById('toast').appendChild(t);
-  setTimeout(()=>t.remove(), 5000);
+  setTimeout(()=>t.remove(), 6000);
 }
 async function api(path, opts={}){
   const r = await fetch(path, {headers:{'Content-Type':'application/json'}, ...opts});
@@ -113,12 +133,17 @@ async function api(path, opts={}){
 function esc(s){ return String(s??'').replace(/[&<>"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
 function badge(cn, kind){ return `<span class="badge ${BADGE[kind]||'badge-secondary'}">${esc(cn)}</span>`; }
 
+let ARTIFACTS = [];
+
 async function refresh(){
   try{
-    const [nodes, deps, events] = await Promise.all([
-      api('/api/nodes'), api('/api/deployments'), api('/api/events?limit=20')
+    const [nodes, deps, events, artifacts] = await Promise.all([
+      api('/api/nodes'), api('/api/deployments'),
+      api('/api/events?limit=20'), api('/api/artifacts')
     ]);
-    renderNodes(nodes); renderFaults(nodes); renderDeps(deps); renderEvents(events);
+    ARTIFACTS = artifacts;
+    renderNodes(nodes); renderFaults(nodes); renderDeps(deps);
+    renderEvents(events); renderArtifacts(artifacts); renderArtifactOptions(artifacts);
     document.getElementById('clock').textContent = '更新于 ' + new Date().toLocaleTimeString();
   }catch(e){ toast('刷新失败: '+e.message, true); }
 }
@@ -148,6 +173,8 @@ function renderFaults(nodes){
       <button class="danger" onclick="setControl('${n.node_id}',{mode:'unreachable'})">模拟失联</button>
       <button class="ghost" onclick="setControl('${n.node_id}',{load_fail:true})">下次加载失败</button>
       <button class="ghost" onclick="setControl('${n.node_id}',{load_fail:false,ack_delay:4})">迟到回执4s</button>
+      <button class="danger" onclick="setControl('${n.node_id}',{corrupt_download:true})">模拟制品损坏</button>
+      <button class="warn" onclick="setControl('${n.node_id}',{download_timeout:true})">模拟下载超时</button>
       <button class="ghost" onclick="resetNode('${n.node_id}')">重置节点</button>
     </div>`).join('');
 }
@@ -161,21 +188,62 @@ async function resetNode(id){
   catch(e){ toast(e.message,true); }
 }
 
+function renderArtifacts(arts){
+  const groups = {};
+  arts.forEach(a=>{ (groups[a.model_name] ||= []).push(a); });
+  const names = Object.keys(groups).sort();
+  document.getElementById('artifacts').innerHTML = names.length ? names.map(m=>`
+    <div style="margin-top:8px">
+      <div style="font-weight:600;font-size:13px">${esc(m)}</div>
+      ${groups[m].map(a=>`<div class="art-row">
+        <span><span class="tag">v${a.version}</span>
+          <span class="muted">${esc(a.filename)} · ${a.size_bytes}B</span></span>
+        <span class="mono muted" title="${esc(a.sha256)}">sha256:${esc(a.sha256_short)}…</span>
+      </div>`).join('')}
+    </div>`).join('') : '<div class="muted">尚未登记任何制品</div>';
+}
+
+function renderArtifactOptions(arts){
+  const sel = document.getElementById('dep-artifact');
+  const current = sel.value;
+  const model = document.getElementById('dep-model').value.trim();
+  const pool = model ? arts.filter(a=>a.model_name===model) : arts;
+  sel.innerHTML = pool.length
+    ? pool.map(a=>`<option value="${esc(a.id)}">${esc(a.model_name)} v${a.version} · sha ${esc(a.sha256_short)}… (${a.size_bytes}B)</option>`).join('')
+    : '<option value="">（请先上传该模型的制品）</option>';
+  if(current && pool.some(a=>a.id===current)) sel.value = current;
+}
+
 const DEP_BADGE={AVAILABLE:'success',FAILED:'danger',UNVERIFIED:'warning',PENDING:'info'};
 const REP_BADGE={LOADED:'success',LOAD_FAILED:'danger',TIMEOUT:'warning',UNVERIFIED:'warning',
   RELEASING:'info',PENDING:'secondary',LOADING:'info',RELEASED:'secondary'};
 
+function digestLine(r){
+  if(!r.loaded_sha256) return '';
+  const ok = r.digest_match === true;
+  const bad = r.digest_match === false;
+  return `<div class="mono" style="margin-top:3px;color:${bad?'#dc2626':'#166534'}">
+    实际加载 sha256: ${esc(r.loaded_sha256.substring(0,12))}…
+    ${ok?'✓ 与所选版本相符':bad?'✗ 与所选版本不符，拒绝判可用':''}</div>`;
+}
+
 function renderDeps(deps){
   document.getElementById('deployments').innerHTML = deps.map(d=>{
-    const reps = d.replicas.map(r=>`<div class="rep">
+    const reps = d.replicas.map(r=>{
+      const bad = r.digest_match === false;
+      return `<div class="rep ${bad?'bad':''}">
       ${esc(r.id)} · ${esc(r.node_name)} · epoch ${r.epoch} · ${badge(r.status_cn, REP_BADGE[r.status]||'secondary')}
+      ${r.expected_sha256?`<div class="mono muted" style="margin-top:3px">期望 sha256: ${esc(r.expected_sha256.substring(0,12))}…</div>`:''}
+      ${digestLine(r)}
       ${r.last_error?`<div class="reason">${esc(r.last_error)}</div>`:''}
-    </div>`).join('');
+    </div>`;}).join('');
     return `<tr>
       <td><b>${esc(d.model_name)}</b><br><span class="muted">${esc(d.id)}<br>尝试 ${d.attempts} 次 · epoch ${d.epoch}</span></td>
-      <td>${d.replica_count} 副本 × ${d.mem_per_replica_mb}MB</td>
+      <td>${d.replica_count} 副本 × ${d.mem_per_replica_mb}MB
+        ${d.version_label?`<br><span class="tag">${esc(d.version_label)}</span>
+          <span class="mono muted" title="${esc(d.expected_sha256||'')}">${esc((d.expected_sha256||'').substring(0,12))}…</span>`:''}</td>
       <td>${badge(d.status_cn, DEP_BADGE[d.status])}<div class="reason">${esc(d.reason||'')}</div></td>
-      <td style="min-width:280px">${reps}
+      <td style="min-width:300px">${reps}
         <details><summary>事件流水</summary><div class="events">
           ${d.events.map(e=>`<div>${esc(e.created_at)} [${esc(e.event_type)}] ${esc(e.detail||'')}</div>`).join('')}
         </div></details></td>
@@ -188,7 +256,7 @@ function renderDeps(deps){
 async function act(id, kind){
   try{ const r = await api(`/api/deployments/${id}/${kind}`,{method:'POST'});
     if(r.reconcile_notes){ r.reconcile_notes.forEach(n=>toast(n)); }
-    else toast(kind==='retry'?'已重新调度':'操作完成'); refresh();
+    else toast(kind==='retry'?'已重新调度（固定原版本）':'操作完成'); refresh();
   }catch(e){ toast(e.message,true); }
 }
 function renderEvents(events){
@@ -197,16 +265,31 @@ function renderEvents(events){
       ${e.node_id?esc(e.node_id)+' ':''}${esc(e.detail||'')}</div>`).join('');
 }
 
+document.getElementById('artifact-form').addEventListener('submit', async (ev)=>{
+  ev.preventDefault();
+  const fd = new FormData(ev.target);
+  try{
+    const r = await fetch('/api/artifacts', {method:'POST', body:fd});
+    const data = await r.json().catch(()=>({}));
+    if(!r.ok) throw new Error(data.detail || ('HTTP '+r.status));
+    toast(`已登记 ${data.model_name} ${data.version_label}，sha256=${data.sha256_short}…`);
+    ev.target.reset(); refresh();
+  }catch(e){ toast(e.message, true); }
+});
+
 document.getElementById('deploy-form').addEventListener('submit', async (ev)=>{
   ev.preventDefault();
   const fd = new FormData(ev.target);
   const body = { model_name: fd.get('model_name'),
+    artifact_id: fd.get('artifact_id') || null,
     mem_per_replica_mb: Number(fd.get('mem_per_replica_mb')),
     replica_count: Number(fd.get('replica_count')) };
   try{ const d = await api('/api/deployments',{method:'POST',body:JSON.stringify(body)});
     toast('部署已受理: '+d.id); ev.target.reset(); refresh();
   }catch(e){ toast(e.message, true); }
 });
+document.getElementById('dep-model').addEventListener('input', ()=>renderArtifactOptions(ARTIFACTS));
+
 refresh();
 setInterval(refresh, 2000);
 </script>
