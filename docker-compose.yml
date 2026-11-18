@@ -1,0 +1,57 @@
+services:
+  platform:
+    build: .
+    container_name: platform
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+    environment:
+      PLATFORM_DB: /data/platform.db
+      PLATFORM_NODES: "node-a|模拟节点A|http://node-a:9001|8192,node-b|模拟节点B|http://node-b:9002|8192"
+      NODE_CALL_TIMEOUT: "1.5"
+      LOAD_TIMEOUT: "30"
+      POLL_INTERVAL: "1"
+      HEALTH_INTERVAL: "10"
+    ports:
+      - "8000:8000"
+    volumes:
+      - platform-data:/data
+    depends_on:
+      - node-a
+      - node-b
+    networks:
+      - platform-net
+
+  node-a:
+    build: .
+    container_name: node-a
+    command: uvicorn node.simulator:app --host 0.0.0.0 --port 9001
+    environment:
+      NODE_ID: node-a
+      NODE_NAME: "模拟节点A"
+      CAPACITY_MB: "8192"
+      DEFAULT_LOAD_DELAY: "0.4"
+      DEFAULT_UNLOAD_DELAY: "0.2"
+    ports:
+      - "9001:9001"
+    networks:
+      - platform-net
+
+  node-b:
+    build: .
+    container_name: node-b
+    command: uvicorn node.simulator:app --host 0.0.0.0 --port 9002
+    environment:
+      NODE_ID: node-b
+      NODE_NAME: "模拟节点B"
+      CAPACITY_MB: "8192"
+      DEFAULT_UNLOAD_DELAY: "0.2"
+    ports:
+      - "9002:9002"
+    networks:
+      - platform-net
+
+networks:
+  platform-net:
+    driver: bridge
+
+volumes:
+  platform-data:

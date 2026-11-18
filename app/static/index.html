@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>推理平台副本调度值班台</title>
+<style>
+  :root { --border:#d9dee7; --bg:#f5f7fa; --blue:#2563eb; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: "PingFang SC","Microsoft YaHei",system-ui,sans-serif;
+         background:var(--bg); color:#1f2937; }
+  header { background:#0f2742; color:#fff; padding:14px 24px; display:flex;
+           align-items:center; justify-content:space-between; }
+  header h1 { font-size:18px; margin:0; }
+  main { max-width:1180px; margin:20px auto; padding:0 16px; }
+  .grid { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
+  @media (max-width:900px){ .grid{grid-template-columns:1fr;} }
+  .card { background:#fff; border:1px solid var(--border); border-radius:10px; padding:16px; margin-bottom:16px; }
+  .card h2 { font-size:15px; margin:0 0 12px; color:#0f2742; }
+  .node { border:1px solid var(--border); border-radius:8px; padding:10px 12px; margin-bottom:10px; }
+  .node .title { display:flex; justify-content:space-between; align-items:center; font-weight:600; }
+  .bar { height:8px; background:#e5e7eb; border-radius:4px; overflow:hidden; margin:8px 0 6px; }
+  .bar > div { height:100%; background:var(--blue); }
+  .bar > div.warn { background:#d97706; } .bar > div.full { background:#dc2626; }
+  .muted { color:#6b7280; font-size:12px; }
+  .badge { display:inline-block; padding:2px 8px; border-radius:999px; font-size:12px; color:#fff; }
+  .badge-success{background:#16a34a;} .badge-danger{background:#dc2626;}
+  .badge-warning{background:#d97706;} .badge-info{background:#2563eb;}
+  .badge-secondary{background:#6b7280;}
+  label { display:block; font-size:13px; margin:8px 0 4px; color:#374151; }
+  input,select { width:100%; padding:8px 10px; border:1px solid var(--border); border-radius:6px; font-size:14px; }
+  button { padding:7px 14px; border:0; border-radius:6px; background:var(--blue); color:#fff;
+           cursor:pointer; font-size:13px; margin-right:6px; }
+  button.ghost { background:#e5e7eb; color:#1f2937; }
+  button.warn { background:#d97706; } button.danger { background:#dc2626; }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th,td { text-align:left; padding:7px 8px; border-bottom:1px solid var(--border); vertical-align:top; }
+  th { color:#475569; font-weight:600; background:#f8fafc; }
+  .rep { font-size:12px; background:#f8fafc; border:1px solid var(--border); border-radius:6px;
+         padding:6px 8px; margin:4px 0; }
+  .reason { font-size:12px; color:#92400e; margin-top:4px; }
+  .events { max-height:160px; overflow:auto; font-size:12px; }
+  .events div { padding:3px 0; border-bottom:1px dashed #e5e7eb; }
+  #toast { position:fixed; top:16px; right:16px; min-width:240px; max-width:380px; z-index:99; }
+  .toast-item { background:#111827; color:#fff; padding:10px 14px; border-radius:8px;
+                margin-bottom:8px; font-size:13px; } .toast-item.err{background:#991b1b;}
+  .controls button { margin-top:6px; }
+  details summary { cursor:pointer; font-size:13px; color:var(--blue); margin:6px 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>🧭 推理平台副本调度值班台</h1>
+  <div class="muted" style="color:#c7d2e8" id="clock"></div>
+</header>
+<main>
+  <div class="grid">
+    <div>
+      <div class="card">
+        <h2>节点显存账本</h2>
+        <div id="nodes"></div>
+      </div>
+      <div class="card">
+        <h2>提交模型部署</h2>
+        <form id="deploy-form">
+          <label>模型名</label>
+          <input name="model_name" placeholder="例如 llama3-8b" required maxlength="64">
+          <label>每副本显存 (MB)</label>
+          <input name="mem_per_replica_mb" type="number" min="1" value="2048" required>
+          <label>副本数（同一部署的副本分处不同节点）</label>
+          <select name="replica_count"><option value="1">1 个副本</option><option value="2">2 个副本</option></select>
+          <div style="margin-top:12px"><button type="submit">提交部署</button></div>
+        </form>
+      </div>
+    </div>
+    <div>
+      <div class="card">
+        <h2>最近事件 <button class="ghost" style="float:right;padding:3px 10px" onclick="refresh()">立即刷新</button></h2>
+        <div class="events" id="events"></div>
+      </div>
+      <div class="card">
+        <h2>故障注入（节点模拟）</h2>
+        <div id="fault-panel"></div>
+      </div>
+    </div>
+  </div>
+  <div class="card">
+    <h2>部署列表与分配状态</h2>
+    <table>
+      <thead><tr><th>部署/模型</th><th>规格</th><th>状态</th><th>副本分配</th><th>操作</th></tr></thead>
+      <tbody id="deployments"></tbody>
+    </table>
+  </div>
+</main>
+<div id="toast"></div>
+
+<script>
+const BADGE = {success:'badge-success',danger:'badge-danger',warning:'badge-warning',
+               info:'badge-info',secondary:'badge-secondary'};
+function toast(msg, isErr){
+  const t=document.createElement('div');
+  t.className='toast-item'+(isErr?' err':''); t.textContent=msg;
+  document.getElementById('toast').appendChild(t);
+  setTimeout(()=>t.remove(), 5000);
+}
+async function api(path, opts={}){
+  const r = await fetch(path, {headers:{'Content-Type':'application/json'}, ...opts});
+  const data = await r.json().catch(()=>({}));
+  if(!r.ok){ throw new Error(data.detail || ('HTTP '+r.status)); }
+  return data;
+}
+function esc(s){ return String(s??'').replace(/[&<>"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+function badge(cn, kind){ return `<span class="badge ${BADGE[kind]||'badge-secondary'}">${esc(cn)}</span>`; }
+
+async function refresh(){
+  try{
+    const [nodes, deps, events] = await Promise.all([
+      api('/api/nodes'), api('/api/deployments'), api('/api/events?limit=20')
+    ]);
+    renderNodes(nodes); renderFaults(nodes); renderDeps(deps); renderEvents(events);
+    document.getElementById('clock').textContent = '更新于 ' + new Date().toLocaleTimeString();
+  }catch(e){ toast('刷新失败: '+e.message, true); }
+}
+
+function renderNodes(nodes){
+  document.getElementById('nodes').innerHTML = nodes.map(n=>{
+    const pct = Math.min(100, Math.round(n.used_mb/n.capacity_mb*100));
+    const cls = pct>=100?'full':(pct>=70?'warn':'');
+    const online = n.online===true ? badge('在线','success')
+      : n.online===false ? badge('失联','danger') : badge('未探测','secondary');
+    return `<div class="node">
+      <div class="title"><span>${esc(n.name)} <span class="muted">(${esc(n.node_id)})</span></span>${online}</div>
+      <div class="bar"><div class="${cls}" style="width:${pct}%"></div></div>
+      <div class="muted">已预留 ${n.used_mb} / ${n.capacity_mb} MB · 剩余 ${n.free_mb} MB
+      ${n.mode?` · 模拟模式: ${esc(n.mode)}`:''}<br>${esc(n.detail||'')} · ${esc(n.last_check||'')}</div>
+    </div>`;
+  }).join('');
+}
+
+function renderFaults(nodes){
+  document.getElementById('fault-panel').innerHTML = nodes.map(n=>`
+    <div class="node controls">
+      <div class="title"><span>${esc(n.name)}</span></div>
+      <button onclick="setControl('${n.node_id}',{mode:'normal'})">恢复正常</button>
+      <button class="warn" onclick="setControl('${n.node_id}',{mode:'slow',load_delay:3})">模拟延迟</button>
+      <button class="danger" onclick="setControl('${n.node_id}',{mode:'fail'})">模拟失败</button>
+      <button class="danger" onclick="setControl('${n.node_id}',{mode:'unreachable'})">模拟失联</button>
+      <button class="ghost" onclick="setControl('${n.node_id}',{load_fail:true})">下次加载失败</button>
+      <button class="ghost" onclick="setControl('${n.node_id}',{load_fail:false,ack_delay:4})">迟到回执4s</button>
+      <button class="ghost" onclick="resetNode('${n.node_id}')">重置节点</button>
+    </div>`).join('');
+}
+async function setControl(id, body){
+  try{ await api(`/api/nodes/${id}/control`,{method:'POST',body:JSON.stringify(body)});
+       toast('故障指令已下发: '+id); refresh(); }
+  catch(e){ toast(e.message,true); }
+}
+async function resetNode(id){
+  try{ await api(`/api/nodes/${id}/reset`,{method:'POST'}); toast('节点已重置 '+id); refresh(); }
+  catch(e){ toast(e.message,true); }
+}
+
+const DEP_BADGE={AVAILABLE:'success',FAILED:'danger',UNVERIFIED:'warning',PENDING:'info'};
+const REP_BADGE={LOADED:'success',LOAD_FAILED:'danger',TIMEOUT:'warning',UNVERIFIED:'warning',
+  RELEASING:'info',PENDING:'secondary',LOADING:'info',RELEASED:'secondary'};
+
+function renderDeps(deps){
+  document.getElementById('deployments').innerHTML = deps.map(d=>{
+    const reps = d.replicas.map(r=>`<div class="rep">
+      ${esc(r.id)} · ${esc(r.node_name)} · epoch ${r.epoch} · ${badge(r.status_cn, REP_BADGE[r.status]||'secondary')}
+      ${r.last_error?`<div class="reason">${esc(r.last_error)}</div>`:''}
+    </div>`).join('');
+    return `<tr>
+      <td><b>${esc(d.model_name)}</b><br><span class="muted">${esc(d.id)}<br>尝试 ${d.attempts} 次 · epoch ${d.epoch}</span></td>
+      <td>${d.replica_count} 副本 × ${d.mem_per_replica_mb}MB</td>
+      <td>${badge(d.status_cn, DEP_BADGE[d.status])}<div class="reason">${esc(d.reason||'')}</div></td>
+      <td style="min-width:280px">${reps}
+        <details><summary>事件流水</summary><div class="events">
+          ${d.events.map(e=>`<div>${esc(e.created_at)} [${esc(e.event_type)}] ${esc(e.detail||'')}</div>`).join('')}
+        </div></details></td>
+      <td style="white-space:nowrap">
+        <button onclick="act('${d.id}','reconcile')">手动对账</button>
+        <button class="warn" ${d.status!=='FAILED'?'disabled':''} onclick="act('${d.id}','retry')">重试</button>
+      </td></tr>`;
+  }).join('') || '<tr><td colspan="5" class="muted">暂无部署</td></tr>';
+}
+async function act(id, kind){
+  try{ const r = await api(`/api/deployments/${id}/${kind}`,{method:'POST'});
+    if(r.reconcile_notes){ r.reconcile_notes.forEach(n=>toast(n)); }
+    else toast(kind==='retry'?'已重新调度':'操作完成'); refresh();
+  }catch(e){ toast(e.message,true); }
+}
+function renderEvents(events){
+  document.getElementById('events').innerHTML =
+    events.map(e=>`<div>${esc(e.created_at)} <b>[${esc(e.event_type)}]</b>
+      ${e.node_id?esc(e.node_id)+' ':''}${esc(e.detail||'')}</div>`).join('');
+}
+
+document.getElementById('deploy-form').addEventListener('submit', async (ev)=>{
+  ev.preventDefault();
+  const fd = new FormData(ev.target);
+  const body = { model_name: fd.get('model_name'),
+    mem_per_replica_mb: Number(fd.get('mem_per_replica_mb')),
+    replica_count: Number(fd.get('replica_count')) };
+  try{ const d = await api('/api/deployments',{method:'POST',body:JSON.stringify(body)});
+    toast('部署已受理: '+d.id); ev.target.reset(); refresh();
+  }catch(e){ toast(e.message, true); }
+});
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>
